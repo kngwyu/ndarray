@@ -18,7 +18,8 @@ use crate::arraytraits;
 use crate::dimension;
 use crate::dimension::IntoDimension;
 use crate::dimension::{
-    abs_index, axes_of, do_slice, merge_axes, size_of_shape_checked, stride_offset, Axes,
+    abs_index, abs_to_usize, axes_of, do_slice, merge_axes, size_of_shape_checked, stride_offset,
+    Axes,
 };
 use crate::error::{self, ErrorKind, ShapeError};
 use crate::itertools::zip;
@@ -2005,7 +2006,8 @@ where
                 2 => {
                     if self.len_of(Axis(1)) <= 1
                         || self.len_of(Axis(0)) > 1
-                            && self.stride_of(Axis(0)).abs() < self.stride_of(Axis(1)).abs()
+                            && abs_to_usize(self.stride_of(Axis(0)))
+                                < abs_to_usize(self.stride_of(Axis(1)))
                     {
                         v.swap_axes(0, 1);
                     }
@@ -2015,7 +2017,7 @@ where
                     let narrow_axis = v
                         .axes()
                         .filter(|ax| ax.len() > 1)
-                        .min_by_key(|ax| ax.stride().abs())
+                        .min_by_key(|ax| abs_to_usize(ax.stride()))
                         .map_or(last, |ax| ax.axis().index());
                     v.swap_axes(last, narrow_axis);
                 }

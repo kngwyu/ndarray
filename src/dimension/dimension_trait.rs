@@ -10,9 +10,8 @@ use std::fmt::Debug;
 use std::ops::{Add, AddAssign, Mul, MulAssign, Sub, SubAssign};
 use std::ops::{Index, IndexMut};
 
-use super::axes_of;
 use super::conversion::Convert;
-use super::{stride_offset, stride_offset_checked};
+use super::{abs_to_usize, axes_of, stride_offset, stride_offset_checked};
 use crate::itertools::{enumerate, zip};
 use crate::Axis;
 use crate::IntoDimension;
@@ -312,7 +311,7 @@ pub trait Dimension:
         };
         axes_of(self, strides)
             .rev()
-            .min_by_key(|ax| ax.stride().abs())
+            .min_by_key(|ax| abs_to_usize(ax.stride()))
             .map_or(Axis(n - 1), |ax| ax.axis())
     }
 
@@ -327,7 +326,7 @@ pub trait Dimension:
         }
         axes_of(self, strides)
             .filter(|ax| ax.len() > 1)
-            .max_by_key(|ax| ax.stride().abs())
+            .max_by_key(|ax| abs_to_usize(ax.stride()))
             .map_or(Axis(0), |ax| ax.axis())
     }
 
@@ -629,7 +628,7 @@ impl Dimension for Dim<[Ix; 2]> {
     fn min_stride_axis(&self, strides: &Self) -> Axis {
         let s = get!(strides, 0) as Ixs;
         let t = get!(strides, 1) as Ixs;
-        if s.abs() < t.abs() {
+        if abs_to_usize(s) < abs_to_usize(t) {
             Axis(0)
         } else {
             Axis(1)

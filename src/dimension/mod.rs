@@ -33,6 +33,15 @@ mod dynindeximpl;
 mod ndindex;
 mod remove_axis;
 
+/// Returns the absolute value of `x` as a `usize`.
+///
+/// This is equivalent to `x.wrapping_abs() as usize`; it correctly handles the
+/// case when `x == isize::MIN`.
+#[inline]
+pub fn abs_to_usize(x: isize) -> usize {
+    x.wrapping_abs() as usize
+}
+
 /// Calculate offset from `Ix` stride converting sign properly
 #[inline(always)]
 pub fn stride_offset(n: Ix, stride: Ix) -> isize {
@@ -156,7 +165,7 @@ where
         .try_fold(0usize, |acc, (&d, &s)| {
             let s = s as isize;
             // Calculate maximum possible absolute movement along this axis.
-            let off = d.saturating_sub(1).checked_mul(s.abs() as usize)?;
+            let off = d.saturating_sub(1).checked_mul(abs_to_usize(s))?;
             acc.checked_add(off)
         })
         .ok_or_else(|| from_kind(ErrorKind::Overflow))?;
@@ -397,7 +406,7 @@ pub fn do_slice(dim: &mut usize, stride: &mut usize, slice: Slice) -> isize {
     };
 
     // Update dimension.
-    let abs_step = step.abs() as usize;
+    let abs_step = abs_to_usize(step);
     *dim = if abs_step == 1 {
         m
     } else {
