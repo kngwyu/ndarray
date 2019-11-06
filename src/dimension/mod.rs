@@ -348,7 +348,7 @@ pub fn abs_index(len: Ix, index: Ixs) -> Ix {
 ///
 /// The return value is (start, end, step).
 ///
-/// **Panics** if stride is 0 or if any index is out of bounds.
+/// **Panics** if step is 0 or if any index is out of bounds.
 fn to_abs_slice(axis_len: usize, slice: Slice) -> (usize, usize, isize) {
     let Slice { start, end, step } = slice;
     let start = abs_index(axis_len, start);
@@ -368,13 +368,13 @@ fn to_abs_slice(axis_len: usize, slice: Slice) -> (usize, usize, isize) {
         end,
         axis_len,
     );
-    ndassert!(step != 0, "Slice stride must not be zero");
+    ndassert!(step != 0, "Slice step must not be zero");
     (start, end, step)
 }
 
 /// Modify dimension, stride and return data pointer offset
 ///
-/// **Panics** if stride is 0 or if any index is out of bounds.
+/// **Panics** if step is 0 or if any index is out of bounds.
 pub fn do_slice(dim: &mut usize, stride: &mut usize, slice: Slice) -> isize {
     let (start, end, step) = to_abs_slice(*dim, slice);
 
