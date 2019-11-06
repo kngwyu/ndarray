@@ -415,9 +415,17 @@ pub fn do_slice(dim: &mut usize, stride: &mut usize, slice: Slice) -> isize {
         d + if r > 0 { 1 } else { 0 }
     };
 
-    // Update stride. The additional check is necessary to avoid possible
-    // overflow in the multiplication.
-    *stride = if *dim <= 1 { 0 } else { (s * step) as usize };
+    // Update stride.
+    *stride = if *dim <= 1 {
+        // Avoid possible overflow. The stride doesn't matter in this case.
+        0
+    } else {
+        // In this case, the new axis length is > 1, so the maximum absolute
+        // offset along the axis will be a nonzero multiple of the new stride.
+        // Since absolute offsets along axes for `ArrayBase` are always within
+        // `isize::MAX`, this multiplication is guaranteed not to overflow.
+        (s * step) as usize
+    };
 
     offset
 }
