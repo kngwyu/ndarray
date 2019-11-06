@@ -222,7 +222,7 @@ where
     pub(crate) unsafe fn new(ptr: NonNull<A>, dim: D, strides: D) -> Self {
         if cfg!(debug_assertions) {
             assert!(is_aligned(ptr.as_ptr()), "The pointer must be aligned.");
-            dimension::max_abs_offset_check_overflow::<A, _>(&dim, &strides).unwrap();
+            dimension::offset_limits_check_overflow::<A, _>(&dim, &strides).unwrap();
         }
         ArrayView {
             data: ViewRepr::new(),
@@ -250,7 +250,7 @@ where
     pub(crate) unsafe fn new(ptr: NonNull<A>, dim: D, strides: D) -> Self {
         if cfg!(debug_assertions) {
             assert!(is_aligned(ptr.as_ptr()), "The pointer must be aligned.");
-            dimension::max_abs_offset_check_overflow::<A, _>(&dim, &strides).unwrap();
+            dimension::offset_limits_check_overflow::<A, _>(&dim, &strides).unwrap();
         }
         ArrayViewMut {
             data: ViewRepr::new(),

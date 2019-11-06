@@ -19,6 +19,7 @@ pub use self::dynindeximpl::IxDynImpl;
 pub use self::ndindex::NdIndex;
 pub use self::remove_axis::RemoveAxis;
 
+use std::convert::TryFrom;
 use std::isize;
 use std::mem;
 
@@ -51,25 +52,26 @@ pub fn stride_offset(n: Ix, stride: Ix) -> isize {
 /// Check whether the given `dim` and `stride` lead to overlapping indices
 ///
 /// There is overlap if, when iterating through the dimensions in order of
-/// increasing stride, the current stride is less than or equal to the maximum
-/// possible offset along the preceding axes. (Axes of length ≤1 are ignored.)
+/// increasing stride, the absolute value of the current stride is less than or
+/// equal to the maximum possible absolute offset along the preceding axes.
+/// (Axes of length ≤1 are ignored.)
 ///
-/// The current implementation assumes that strides of axes with length > 1 are
-/// nonnegative. Additionally, it does not check for overflow.
+/// The current implementation does not check for overflow.
 pub fn dim_stride_overlap<D: Dimension>(dim: &D, strides: &D) -> bool {
+    // FIXME: `order` is incorrect in presence of negative strides.
     let order = strides._fastest_varying_stride_order();
-    let mut sum_prev_offsets = 0;
+    let mut sum_prev_abs_offsets = 0;
     for &index in order.slice() {
         let d = dim[index];
-        let s = strides[index] as isize;
         match d {
             0 => return false,
             1 => {}
             _ => {
-                if s <= sum_prev_offsets {
+                let s_abs = (strides[index] as isize).abs();
+                if s_abs <= sum_prev_abs_offsets {
                     return true;
                 }
-                sum_prev_offsets += (d - 1) as isize * s;
+                sum_prev_abs_offsets += (d - 1) as isize * s_abs;
             }
         }
     }
@@ -133,10 +135,10 @@ pub fn can_index_slice_not_custom<A, D: Dimension>(data: &[A], dim: &D) -> Resul
     Ok(())
 }
 
-/// Returns the absolute difference in units of `A` between least and greatest
-/// address accessible by moving along all axes.
+/// Returns the minimum and maximum possible offsets in units of `A` relative
+/// to the first element reachable by moving along all axes.
 ///
-/// Returns `Ok` only if
+/// Returns `Ok((min_offset, max_offset))` only if
 ///
 /// 1. The ndim of `dim` and `strides` is the same.
 ///
@@ -147,7 +149,14 @@ pub fn can_index_slice_not_custom<A, D: Dimension>(data: &[A], dim: &D) -> Resul
 /// 3. The product of non-zero axis lengths does not exceed `isize::MAX`. (This
 ///    also implies that the length of any individual axis does not exceed
 ///    `isize::MAX`.)
-pub fn max_abs_offset_check_overflow<A, D>(dim: &D, strides: &D) -> Result<usize, ShapeError>
+///
+/// Note that the returned values of `min_offset` and `max_offset` always meet
+/// the following conditions: `min_offset <= 0 && min_offset >= -isize::MAX`
+/// and `max_offset >= 0 && max_offset <= isize::MAX`.
+pub fn offset_limits_check_overflow<A, D>(
+    dim: &D,
+    strides: &D,
+) -> Result<(isize, isize), ShapeError>
 where
     D: Dimension,
 {
@@ -159,32 +168,45 @@ where
     // Condition 3.
     let _ = size_of_shape_checked(dim)?;
 
-    // Determine absolute difference in units of `A` between least and greatest
-    // address accessible by moving along all axes.
-    let max_offset: usize = izip!(dim.slice(), strides.slice())
-        .try_fold(0usize, |acc, (&d, &s)| {
+    // Determine minimum and maximum offsets in units of `A` relative to the
+    // first element reachable by moving along all axes.
+    let (min_offset, max_offset): (isize, isize) = izip!(dim.slice(), strides.slice())
+        .try_fold((0isize, 0isize), |(min_off, max_off), (&d, &s)| {
             let s = s as isize;
-            // Calculate maximum possible absolute movement along this axis.
-            let off = d.saturating_sub(1).checked_mul(abs_to_usize(s))?;
-            acc.checked_add(off)
+            // Calculate maximum index along this axis. The conversion to
+            // `isize` is guaranteed not to overflow because of the
+            // `size_of_shape_checked(dim)` call above.
+            let max_index = d.saturating_sub(1) as isize;
+            // Calculate largest possible movement along this axis relative to
+            // the first element.
+            let off = max_index.checked_mul(s)?;
+            if off < 0 {
+                Some((min_off.checked_add(off)?, max_off))
+            } else {
+                Some((min_off, max_off.checked_add(off)?))
+            }
         })
         .ok_or_else(|| from_kind(ErrorKind::Overflow))?;
-    // Condition 2a.
-    if max_offset > isize::MAX as usize {
-        return Err(from_kind(ErrorKind::Overflow));
-    }
 
-    // Determine absolute difference in units of bytes between least and
-    // greatest address accessible by moving along all axes
-    let max_offset_bytes = max_offset
-        .checked_mul(mem::size_of::<A>())
+    // Determine absolute difference in units of `A` between least and greatest
+    // address accessible by moving along all axes. (This also checks condition
+    // 2a.)
+    let max_abs_offset: isize = max_offset
+        .checked_sub(min_offset)
         .ok_or_else(|| from_kind(ErrorKind::Overflow))?;
-    // Condition 2b.
-    if max_offset_bytes > isize::MAX as usize {
-        return Err(from_kind(ErrorKind::Overflow));
+
+    if max_abs_offset != 0 {
+        let elem_size: isize =
+            isize::try_from(mem::size_of::<A>()).map_err(|_| from_kind(ErrorKind::Overflow))?;
+        // Determine absolute difference in units of bytes between least and
+        // greatest address accessible by moving along all axes. (This also
+        // checks condition 2b.)
+        let _max_abs_offset_bytes: isize = max_abs_offset
+            .checked_mul(elem_size)
+            .ok_or_else(|| from_kind(ErrorKind::Overflow))?;
     }
 
-    Ok(max_offset)
+    Ok((min_offset, max_offset))
 }
 
 /// Checks whether the given data, dimension, and strides meet the invariants
@@ -223,24 +245,21 @@ pub fn can_index_slice<A, D: Dimension>(
     dim: &D,
     strides: &D,
 ) -> Result<(), ShapeError> {
-    // Check conditions 1 and 2 and calculate `max_offset`.
-    let max_offset = max_abs_offset_check_overflow::<A, _>(dim, strides)?;
+    // Check conditions 1 and 2 and calculate offset limits.
+    let (min_offset, max_offset) = offset_limits_check_overflow::<A, _>(dim, strides)?;
+
+    // Check condition 3.
+    if min_offset < 0 {
+        return Err(from_kind(ErrorKind::Unsupported));
+    }
 
     // Check condition 4.
     let is_empty = dim.slice().iter().any(|&d| d == 0);
-    if is_empty && max_offset > data.len() {
+    if is_empty && max_offset as usize > data.len() {
         return Err(from_kind(ErrorKind::OutOfBounds));
     }
-    if !is_empty && max_offset >= data.len() {
+    if !is_empty && max_offset as usize >= data.len() {
         return Err(from_kind(ErrorKind::OutOfBounds));
-    }
-
-    // Check condition 3.
-    for (&d, &s) in izip!(dim.slice(), strides.slice()) {
-        let s = s as isize;
-        if d > 1 && s < 0 {
-            return Err(from_kind(ErrorKind::Unsupported));
-        }
     }
 
     // Check condition 5.
@@ -651,8 +670,8 @@ where
 mod test {
     use super::{
         arith_seq_intersect, can_index_slice, can_index_slice_not_custom, extended_gcd,
-        max_abs_offset_check_overflow, slice_min_max, slices_intersect,
-        solve_linear_diophantine_eq, IntoDimension,
+        offset_limits_check_overflow, slice_min_max, slices_intersect, solve_linear_diophantine_eq,
+        IntoDimension,
     };
     use crate::error::{from_kind, ErrorKind};
     use crate::slice::Slice;
@@ -689,19 +708,19 @@ mod test {
     }
 
     #[test]
-    fn max_abs_offset_check_overflow_examples() {
+    fn offset_limits_check_overflow_examples() {
         let dim = (1, ::std::isize::MAX as usize, 1).into_dimension();
         let strides = (1, 1, 1).into_dimension();
-        max_abs_offset_check_overflow::<u8, _>(&dim, &strides).unwrap();
+        offset_limits_check_overflow::<u8, _>(&dim, &strides).unwrap();
         let dim = (1, ::std::isize::MAX as usize, 2).into_dimension();
         let strides = (1, 1, 1).into_dimension();
-        max_abs_offset_check_overflow::<u8, _>(&dim, &strides).unwrap_err();
+        offset_limits_check_overflow::<u8, _>(&dim, &strides).unwrap_err();
         let dim = (0, 2, 2).into_dimension();
         let strides = (1, ::std::isize::MAX as usize, 1).into_dimension();
-        max_abs_offset_check_overflow::<u8, _>(&dim, &strides).unwrap_err();
+        offset_limits_check_overflow::<u8, _>(&dim, &strides).unwrap_err();
         let dim = (0, 2, 2).into_dimension();
         let strides = (1, ::std::isize::MAX as usize / 4, 1).into_dimension();
-        max_abs_offset_check_overflow::<i32, _>(&dim, &strides).unwrap_err();
+        offset_limits_check_overflow::<i32, _>(&dim, &strides).unwrap_err();
     }
 
     #[test]

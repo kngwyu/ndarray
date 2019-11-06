@@ -70,7 +70,7 @@ where
         let strides = shape.strides;
         if cfg!(debug_assertions) {
             assert!(!ptr.is_null(), "The pointer must be non-null.");
-            dimension::max_abs_offset_check_overflow::<A, _>(&dim, &strides).unwrap();
+            dimension::offset_limits_check_overflow::<A, _>(&dim, &strides).unwrap();
         }
         RawArrayView::new_(ptr, dim, strides)
     }
@@ -202,7 +202,7 @@ where
         let strides = shape.strides;
         if cfg!(debug_assertions) {
             assert!(!ptr.is_null(), "The pointer must be non-null.");
-            dimension::max_abs_offset_check_overflow::<A, _>(&dim, &strides).unwrap();
+            dimension::offset_limits_check_overflow::<A, _>(&dim, &strides).unwrap();
         }
         RawArrayViewMut::new_(ptr, dim, strides)
     }
