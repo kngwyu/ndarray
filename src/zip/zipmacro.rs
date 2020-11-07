@@ -38,8 +38,6 @@
 /// ## Examples
 ///
 /// ```rust
-/// extern crate ndarray;
-///
 /// use ndarray::{azip, Array1, Array2, Axis};
 ///
 /// type M = Array2<f32>;
@@ -121,6 +119,12 @@ macro_rules! azip {
         $crate::Zip::from($first_prod)
             $(.and($prod))*
             .$apply(|$first_pat, $($pat),*| $body)
+    };
+
+    // Unindexed with one or more producer, no loop body
+    (@build $apply:ident $first_prod:expr $(, $prod:expr)* $(,)?) => {
+        $crate::Zip::from($first_prod)
+            $(.and($prod))*
     };
     // catch-all rule
     (@build $($t:tt)*) => { compile_error!("Invalid syntax in azip!()") };

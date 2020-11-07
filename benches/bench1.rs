@@ -258,22 +258,66 @@ fn add_2d_zip(bench: &mut test::Bencher) {
 }
 
 #[bench]
-fn add_2d_alloc(bench: &mut test::Bencher) {
+fn add_2d_alloc_plus(bench: &mut test::Bencher) {
     let a = Array::<i32, _>::zeros((ADD2DSZ, ADD2DSZ));
     let b = Array::<i32, _>::zeros((ADD2DSZ, ADD2DSZ));
     bench.iter(|| &a + &b);
 }
 
 #[bench]
-fn add_2d_zip_alloc(bench: &mut test::Bencher) {
+fn add_2d_alloc_zip_uninit(bench: &mut test::Bencher) {
     let a = Array::<i32, _>::zeros((ADD2DSZ, ADD2DSZ));
     let b = Array::<i32, _>::zeros((ADD2DSZ, ADD2DSZ));
     bench.iter(|| unsafe {
         let mut c = Array::uninitialized(a.dim());
-        azip!((&a in &a, &b in &b, c in &mut c) *c = a + b);
+        azip!((&a in &a, &b in &b, c in c.raw_view_mut())
+            std::ptr::write(c, a + b)
+        );
         c
     });
 }
+
+#[bench]
+fn add_2d_alloc_zip_collect(bench: &mut test::Bencher) {
+    let a = Array::<i32, _>::zeros((ADD2DSZ, ADD2DSZ));
+    let b = Array::<i32, _>::zeros((ADD2DSZ, ADD2DSZ));
+    bench.iter(|| {
+        Zip::from(&a).and(&b).apply_collect(|&x, &y| x + y)
+    });
+}
+
+#[bench]
+fn vec_string_collect(bench: &mut test::Bencher) {
+    let v = vec![""; 10240];
+    bench.iter(|| {
+        v.iter().map(|s| s.to_owned()).collect::<Vec<_>>()
+    });
+}
+
+#[bench]
+fn array_string_collect(bench: &mut test::Bencher) {
+    let v = Array::from(vec![""; 10240]);
+    bench.iter(|| {
+        Zip::from(&v).apply_collect(|s| s.to_owned())
+    });
+}
+
+#[bench]
+fn vec_f64_collect(bench: &mut test::Bencher) {
+    let v = vec![1.; 10240];
+    bench.iter(|| {
+        v.iter().map(|s| s + 1.).collect::<Vec<_>>()
+    });
+}
+
+#[bench]
+fn array_f64_collect(bench: &mut test::Bencher) {
+    let v = Array::from(vec![1.; 10240]);
+    bench.iter(|| {
+        Zip::from(&v).apply_collect(|s| s + 1.)
+    });
+}
+
 
 #[bench]
 fn add_2d_assign_ops(bench: &mut test::Bencher) {

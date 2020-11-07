@@ -11,7 +11,6 @@
     clippy::many_single_char_names,
     clippy::deref_addrof,
     clippy::unreadable_literal,
-    clippy::many_single_char_names
 )]
 
 //! The `ndarray` crate provides an *n*-dimensional container for general elements
@@ -53,8 +52,9 @@
 //! - Performance:
 //!   + Prefer higher order methods and arithmetic operations on arrays first,
 //!     then iteration, and as a last priority using indexed algorithms.
-//!   + The higher order functions like ``.map()``, ``.map_inplace()``,
-//!     ``.zip_mut_with()``, ``Zip`` and ``azip!()`` are the most efficient ways
+//!   + The higher order functions like [`.map()`](ArrayBase::map),
+//!     [`.map_inplace()`](ArrayBase::map_inplace), [`.zip_mut_with()`](ArrayBase::zip_mut_with),
+//!     [`Zip`] and [`azip!()`](azip) are the most efficient ways
 //!     to perform single traversal and lock step traversal respectively.
 //!   + Performance of an operation depends on the memory layout of the array
 //!     or array view. Especially if it's a binary operation, which
@@ -131,7 +131,9 @@ use crate::iterators::{ElementsBase, ElementsBaseMut, Iter, IterMut, Lanes, Lane
 
 pub use crate::arraytraits::AsArray;
 pub use crate::linalg_traits::{LinalgScalar, NdFloat};
-pub use crate::stacking::stack;
+
+#[allow(deprecated)]
+pub use crate::stacking::{concatenate, stack, stack_new_axis};
 
 pub use crate::impl_views::IndexLonger;
 pub use crate::shape_builder::ShapeBuilder;
@@ -149,13 +151,17 @@ mod array_approx;
 mod array_serde;
 mod arrayformat;
 mod arraytraits;
+mod argument_traits;
+pub use crate::argument_traits::AssignElem;
 mod data_traits;
+mod data_repr;
 
 pub use crate::aliases::*;
 
 #[allow(deprecated)]
 pub use crate::data_traits::{
     Data, DataClone, DataMut, DataOwned, DataShared, RawData, RawDataClone, RawDataMut,
+    RawDataSubst,
 };
 
 mod free_functions;
@@ -172,9 +178,11 @@ mod linalg_traits;
 mod linspace;
 mod logspace;
 mod numeric_util;
+mod partial;
 mod shape_builder;
 #[macro_use]
 mod slice;
+mod split_at;
 mod stacking;
 #[macro_use]
 mod zip;
@@ -296,9 +304,10 @@ pub type Ixs = isize;
 /// Please see the documentation for the respective array view for an overview
 /// of methods specific to array views: [`ArrayView`], [`ArrayViewMut`].
 ///
-/// A view is created from an array using `.view()`, `.view_mut()`, using
-/// slicing (`.slice()`, `.slice_mut()`) or from one of the many iterators
-/// that yield array views.
+/// A view is created from an array using [`.view()`](ArrayBase::view),
+/// [`.view_mut()`](ArrayBase::view_mut), using
+/// slicing ([`.slice()`](ArrayBase::slice), [`.slice_mut()`](ArrayBase::slice_mut)) or from one of
+/// the many iterators that yield array views.
 ///
 /// You can also create an array view from a regular slice of data not
 /// allocated with `Array` — see array view methods or their `From` impls.
@@ -341,15 +350,15 @@ pub type Ixs = isize;
 ///
 /// Important traits and types for dimension and indexing:
 ///
-/// - A [`Dim`](Dim.t.html) value represents a dimensionality or index.
-/// - Trait [`Dimension`](Dimension.t.html) is implemented by all
+/// - A [`Dim`](struct.Dim.html) value represents a dimensionality or index.
+/// - Trait [`Dimension`](trait.Dimension.html) is implemented by all
 /// dimensionalities. It defines many operations for dimensions and indices.
-/// - Trait [`IntoDimension`](IntoDimension.t.html) is used to convert into a
+/// - Trait [`IntoDimension`](trait.IntoDimension.html) is used to convert into a
 /// `Dim` value.
-/// - Trait [`ShapeBuilder`](ShapeBuilder.t.html) is an extension of
+/// - Trait [`ShapeBuilder`](trait.ShapeBuilder.html) is an extension of
 /// `IntoDimension` and is used when constructing an array. A shape describes
 /// not just the extent of each axis but also their strides.
-/// - Trait [`NdIndex`](NdIndex.t.html) is an extension of `Dimension` and is
+/// - Trait [`NdIndex`](trait.NdIndex.html) is an extension of `Dimension` and is
 /// for values that can be used with indexing syntax.
 ///
 ///
@@ -483,11 +492,8 @@ pub type Ixs = isize;
 /// [`.multi_slice_move()`]: type.ArrayViewMut.html#method.multi_slice_move
 ///
 /// ```
-/// extern crate ndarray;
 ///
 /// use ndarray::{arr2, arr3, s};
-///
-/// fn main() {
 ///
 /// // 2 submatrices of 2 rows with 3 elements per row, means a shape of `[2, 2, 3]`.
 ///
@@ -546,7 +552,6 @@ pub type Ixs = isize;
 ///                [5, 7]]);
 /// assert_eq!(s0, i);
 /// assert_eq!(s1, j);
-/// }
 /// ```
 ///
 /// ## Subviews
@@ -579,11 +584,9 @@ pub type Ixs = isize;
 /// [`.outer_iter_mut()`]: #method.outer_iter_mut
 ///
 /// ```
-/// extern crate ndarray;
 ///
 /// use ndarray::{arr3, aview1, aview2, s, Axis};
 ///
-/// # fn main() {
 ///
 /// // 2 submatrices of 2 rows with 3 elements per row, means a shape of `[2, 2, 3]`.
 ///
@@ -617,7 +620,6 @@ pub type Ixs = isize;
 /// // You can take multiple subviews at once (and slice at the same time)
 /// let double_sub = a.slice(s![1, .., 0]);
 /// assert_eq!(double_sub, aview1(&[7, 10]));
-/// # }
 /// ```
 ///
 /// ## Arithmetic Operations
@@ -1063,7 +1065,6 @@ pub type Ixs = isize;
 /// ```rust
 /// use ndarray::{array, Array2};
 ///
-/// # fn main() -> Result<(), Box<std::error::Error>> {
 /// let ncols = 3;
 /// let mut data = Vec::new();
 /// let mut nrows = 0;
@@ -1075,8 +1076,7 @@ pub type Ixs = isize;
 /// }
 /// let arr = Array2::from_shape_vec((nrows, ncols), data)?;
 /// assert_eq!(arr, array![[0, 0, 0], [1, 1, 1]]);
-/// # Ok(())
-/// # }
+/// # Ok::<(), ndarray::ShapeError>(())
 /// ```
 ///
 /// If neither of these options works for you, and you really need to convert
@@ -1089,7 +1089,6 @@ pub type Ixs = isize;
 /// ```rust
 /// use ndarray::{array, Array2, Array3};
 ///
-/// # fn main() -> Result<(), Box<std::error::Error>> {
 /// let nested: Vec<Array2<i32>> = vec![
 ///     array![[1, 2, 3], [4, 5, 6]],
 ///     array![[7, 8, 9], [10, 11, 12]],
@@ -1102,8 +1101,7 @@ pub type Ixs = isize;
 ///     [[1, 2, 3], [4, 5, 6]],
 ///     [[7, 8, 9], [10, 11, 12]],
 /// ]);
-/// # Ok(())
-/// # }
+/// # Ok::<(), ndarray::ShapeError>(())
 /// ```
 ///
 /// Note that this implementation assumes that the nested `Vec`s are all the
@@ -1289,10 +1287,10 @@ pub type ArcArray<A, D> = ArrayBase<OwnedArcRepr<A>, D>;
 /// + [Constructor Methods for Owned Arrays](struct.ArrayBase.html#constructor-methods-for-owned-arrays)
 /// + [Methods For All Array Types](struct.ArrayBase.html#methods-for-all-array-types)
 /// + Dimensionality-specific type alises
-/// [`Array1`](Array1.t.html),
-/// [`Array2`](Array2.t.html),
-/// [`Array3`](Array3.t.html), ...,
-/// [`ArrayD`](ArrayD.t.html),
+/// [`Array1`](type.Array1.html),
+/// [`Array2`](type.Array2.html),
+/// [`Array3`](type.Array3.html), ...,
+/// [`ArrayD`](type.ArrayD.html),
 /// and so on.
 pub type Array<A, D> = ArrayBase<OwnedRepr<A>, D>;
 
@@ -1397,12 +1395,8 @@ pub type RawArrayView<A, D> = ArrayBase<RawViewRepr<*const A>, D>;
 /// [`from_shape_ptr`](#method.from_shape_ptr) for details.
 pub type RawArrayViewMut<A, D> = ArrayBase<RawViewRepr<*mut A>, D>;
 
-/// Array's representation.
-///
-/// *Don’t use this type directly—use the type alias
-/// [`Array`](type.Array.html) for the array type!*
-#[derive(Clone, Debug)]
-pub struct OwnedRepr<A>(Vec<A>);
+pub use data_repr::OwnedRepr;
+
 
 /// RcArray's representation.
 ///
@@ -1416,7 +1410,7 @@ pub use self::OwnedArcRepr as OwnedRcRepr;
 /// *Don’t use this type directly—use the type alias
 /// [`ArcArray`](type.ArcArray.html) for the array type!*
 #[derive(Debug)]
-pub struct OwnedArcRepr<A>(Arc<Vec<A>>);
+pub struct OwnedArcRepr<A>(Arc<OwnedRepr<A>>);
 
 impl<A> Clone for OwnedArcRepr<A> {
     fn clone(&self) -> Self {
@@ -1495,6 +1489,7 @@ mod impl_constructors;
 
 mod impl_methods;
 mod impl_owned_array;
+mod impl_special_element_types;
 
 /// Private Methods
 impl<A, S, D> ArrayBase<S, D>

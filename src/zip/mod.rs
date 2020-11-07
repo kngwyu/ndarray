@@ -9,14 +9,18 @@
 #[macro_use]
 mod zipmacro;
 
+use std::mem::MaybeUninit;
+
 use crate::imp_prelude::*;
+use crate::AssignElem;
 use crate::IntoDimension;
 use crate::Layout;
 use crate::NdIndex;
+use crate::partial::Partial;
 
 use crate::indexes::{indices, Indices};
-use crate::layout::LayoutPriv;
 use crate::layout::{CORDER, FORDER};
+use crate::split_at::{SplitPreference, SplitAt};
 
 /// Return if the expression is a break value.
 macro_rules! fold_while {
@@ -51,17 +55,26 @@ where
     D: Dimension,
 {
     pub(crate) fn layout_impl(&self) -> Layout {
-        Layout::new(if self.is_standard_layout() {
-            if self.ndim() <= 1 {
-                FORDER | CORDER
+        let n = self.ndim();
+        if self.is_standard_layout() {
+            if n <= 1 {
+                Layout::one_dimensional()
             } else {
-                CORDER
+                Layout::c()
             }
-        } else if self.ndim() > 1 && self.raw_view().reversed_axes().is_standard_layout() {
-            FORDER
+        } else if n > 1 && self.raw_view().reversed_axes().is_standard_layout() {
+            Layout::f()
+        } else if n > 1 {
+            if self.stride_of(Axis(0)) == 1 {
+                Layout::fpref()
+            } else if self.stride_of(Axis(n - 1)) == 1 {
+                Layout::cpref()
+            } else {
+                Layout::none()
+            }
         } else {
-            0
-        })
+            Layout::none()
+        }
     }
 }
 
@@ -76,25 +89,6 @@ where
         unsafe { ArrayView::new(res.ptr, res.dim, res.strides) }
     }
     private_impl! {}
-}
-
-pub trait Splittable: Sized {
-    fn split_at(self, axis: Axis, index: Ix) -> (Self, Self);
-}
-
-impl<D> Splittable for D
-where
-    D: Dimension,
-{
-    fn split_at(self, axis: Axis, index: Ix) -> (Self, Self) {
-        let mut d1 = self;
-        let mut d2 = d1.clone();
-        let i = axis.index();
-        let len = d1[i];
-        d1[i] = index;
-        d2[i] = len - index;
-        (d1, d2)
-    }
 }
 
 /// Argument conversion into a producer.
@@ -184,6 +178,7 @@ pub trait NdProducer {
     fn split_at(self, axis: Axis, index: usize) -> (Self, Self)
     where
         Self: Sized;
+
     private_decl! {}
 }
 
@@ -571,13 +566,25 @@ impl<A, D: Dimension> NdProducer for RawArrayViewMut<A, D> {
 ///
 /// // Check the result against the built in `.sum_axis()` along axis 1.
 /// assert_eq!(totals, a.sum_axis(Axis(1)));
+///
+///
+/// // Example 3: Recreate Example 2 using apply_collect to make a new array
+///
+/// let mut totals2 = Zip::from(a.genrows()).apply_collect(|row| row.sum());
+///
+/// // Check the result against the previous example.
+/// assert_eq!(totals, totals2);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Zip<Parts, D> {
     parts: Parts,
     dimension: D,
     layout: Layout,
+    /// The sum of the layout tendencies of the parts;
+    /// positive for c- and negative for f-layout preference.
+    layout_tendency: i32,
 }
+
 
 impl<P, D> Zip<(P,), D>
 where
@@ -594,10 +601,12 @@ where
     {
         let array = p.into_producer();
         let dim = array.raw_dim();
+        let layout = array.layout();
         Zip {
             dimension: dim,
-            layout: array.layout(),
+            layout,
             parts: (array,),
+            layout_tendency: layout.tendency(),
         }
     }
 }
@@ -650,24 +659,29 @@ where
         self.dimension[axis.index()]
     }
 
+    fn prefer_f(&self) -> bool {
+        !self.layout.is(CORDER) && (self.layout.is(FORDER) || self.layout_tendency < 0)
+    }
+
     /// Return an *approximation* to the max stride axis; if
     /// component arrays disagree, there may be no choice better than the
     /// others.
     fn max_stride_axis(&self) -> Axis {
-        let i = match self.layout.flag() {
-            FORDER => self
+        let i = if self.prefer_f() {
+            self
                 .dimension
                 .slice()
                 .iter()
                 .rposition(|&len| len > 1)
-                .unwrap_or(self.dimension.ndim() - 1),
+                .unwrap_or(self.dimension.ndim() - 1)
+        } else {
             /* corder or default */
-            _ => self
+            self
                 .dimension
                 .slice()
                 .iter()
                 .position(|&len| len > 1)
-                .unwrap_or(0),
+                .unwrap_or(0)
         };
         Axis(i)
     }
@@ -688,7 +702,8 @@ where
             self.apply_core_strided(acc, function)
         }
     }
-    fn apply_core_contiguous<F, Acc>(&mut self, mut acc: Acc, mut function: F) -> FoldWhile<Acc>
+
+    fn apply_core_contiguous<F, Acc>(&mut self, acc: Acc, mut function: F) -> FoldWhile<Acc>
     where
         F: FnMut(Acc, P::Item) -> FoldWhile<Acc>,
         P: ZippableTuple<Dim = D>,
@@ -697,16 +712,36 @@ where
         let size = self.dimension.size();
         let ptrs = self.parts.as_ptr();
         let inner_strides = self.parts.contiguous_stride();
-        for i in 0..size {
-            unsafe {
-                let ptr_i = ptrs.stride_offset(inner_strides, i);
-                acc = fold_while![function(acc, self.parts.as_ref(ptr_i))];
-            }
+        unsafe {
+            self.inner(acc, ptrs, inner_strides, size, &mut function)
+        }
+    }
+
+    /// The innermost loop of the Zip apply methods
+    ///
+    /// Run the fold while operation on a stretch of elements with constant strides
+    ///
+    /// `ptr`: base pointer for the first element in this stretch
+    /// `strides`: strides for the elements in this stretch
+    /// `len`: number of elements
+    /// `function`: closure
+    unsafe fn inner<F, Acc>(&self, mut acc: Acc, ptr: P::Ptr, strides: P::Stride,
+                            len: usize, function: &mut F) -> FoldWhile<Acc>
+    where
+        F: FnMut(Acc, P::Item) -> FoldWhile<Acc>,
+        P: ZippableTuple
+    {
+        let mut i = 0;
+        while i < len {
+            let p = ptr.stride_offset(strides, i);
+            acc = fold_while!(function(acc, self.parts.as_ref(p)));
+            i += 1;
         }
         FoldWhile::Continue(acc)
     }
 
-    fn apply_core_strided<F, Acc>(&mut self, mut acc: Acc, mut function: F) -> FoldWhile<Acc>
+
+    fn apply_core_strided<F, Acc>(&mut self, acc: Acc, function: F) -> FoldWhile<Acc>
     where
         F: FnMut(Acc, P::Item) -> FoldWhile<Acc>,
         P: ZippableTuple<Dim = D>,
@@ -715,25 +750,68 @@ where
         if n == 0 {
             panic!("Unreachable: ndim == 0 is contiguous")
         }
+        if n == 1 || self.layout_tendency >= 0 {
+            self.apply_core_strided_c(acc, function)
+        } else {
+            self.apply_core_strided_f(acc, function)
+        }
+    }
+
+    // Non-contiguous but preference for C - unroll over Axis(ndim - 1)
+    fn apply_core_strided_c<F, Acc>(&mut self, mut acc: Acc, mut function: F) -> FoldWhile<Acc>
+    where
+        F: FnMut(Acc, P::Item) -> FoldWhile<Acc>,
+        P: ZippableTuple<Dim = D>,
+    {
+        let n = self.dimension.ndim();
         let unroll_axis = n - 1;
         let inner_len = self.dimension[unroll_axis];
         self.dimension[unroll_axis] = 1;
         let mut index_ = self.dimension.first_index();
         let inner_strides = self.parts.stride_of(unroll_axis);
+        // Loop unrolled over closest axis
         while let Some(index) = index_ {
-            // Let's “unroll” the loop over the innermost axis
             unsafe {
                 let ptr = self.parts.uget_ptr(&index);
-                for i in 0..inner_len {
-                    let p = ptr.stride_offset(inner_strides, i);
-                    acc = fold_while!(function(acc, self.parts.as_ref(p)));
-                }
+                acc = fold_while![self.inner(acc, ptr, inner_strides, inner_len, &mut function)];
             }
 
             index_ = self.dimension.next_for(index);
         }
-        self.dimension[unroll_axis] = inner_len;
         FoldWhile::Continue(acc)
+    }
+
+    // Non-contiguous but preference for F - unroll over Axis(0)
+    fn apply_core_strided_f<F, Acc>(&mut self, mut acc: Acc, mut function: F) -> FoldWhile<Acc>
+    where
+        F: FnMut(Acc, P::Item) -> FoldWhile<Acc>,
+        P: ZippableTuple<Dim = D>,
+    {
+        let unroll_axis = 0;
+        let inner_len = self.dimension[unroll_axis];
+        self.dimension[unroll_axis] = 1;
+        let index_ = self.dimension.first_index();
+        let inner_strides = self.parts.stride_of(unroll_axis);
+        // Loop unrolled over closest axis
+        if let Some(mut index) = index_ {
+            loop {
+                unsafe {
+                    let ptr = self.parts.uget_ptr(&index);
+                    acc = fold_while![self.inner(acc, ptr, inner_strides, inner_len, &mut function)];
+                }
+
+                if !self.dimension.next_for_f(&mut index) {
+                    break;
+                }
+            }
+        }
+        FoldWhile::Continue(acc)
+    }
+
+    pub(crate) fn uninitalized_for_current_layout<T>(&self) -> Array<MaybeUninit<T>, D>
+    {
+        let is_f = self.prefer_f();
+        Array::maybe_uninit(self.dimension.clone().set_f(is_f))
     }
 }
 
@@ -952,15 +1030,9 @@ macro_rules! map_impl {
             pub fn and<P>(self, p: P) -> Zip<($($p,)* P::Output, ), D>
                 where P: IntoNdProducer<Dim=D>,
             {
-                let array = p.into_producer();
-                self.check(&array);
-                let part_layout = array.layout();
-                let ($($p,)*) = self.parts;
-                Zip {
-                    parts: ($($p,)* array, ),
-                    layout: self.layout.and(part_layout),
-                    dimension: self.dimension,
-                }
+                let part = p.into_producer();
+                self.check(&part);
+                self.build_and(part)
             }
 
             /// Include the producer `p` in the Zip, broadcasting if needed.
@@ -973,15 +1045,60 @@ macro_rules! map_impl {
                 where P: IntoNdProducer<Dim=D2, Output=ArrayView<'a, Elem, D2>, Item=&'a Elem>,
                       D2: Dimension,
             {
-                let array = p.into_producer().broadcast_unwrap(self.dimension.clone());
-                let part_layout = array.layout();
+                let part = p.into_producer().broadcast_unwrap(self.dimension.clone());
+                self.build_and(part)
+            }
+
+            fn build_and<P>(self, part: P) -> Zip<($($p,)* P, ), D>
+                where P: NdProducer<Dim=D>,
+            {
+                let part_layout = part.layout();
                 let ($($p,)*) = self.parts;
                 Zip {
-                    parts: ($($p,)* array, ),
-                    layout: self.layout.and(part_layout),
+                    parts: ($($p,)* part, ),
+                    layout: self.layout.intersect(part_layout),
                     dimension: self.dimension,
+                    layout_tendency: self.layout_tendency + part_layout.tendency(),
                 }
             }
+
+            /// Apply and collect the results into a new array, which has the same size as the
+            /// inputs.
+            ///
+            /// If all inputs are c- or f-order respectively, that is preserved in the output.
+            pub fn apply_collect<R>(self, f: impl FnMut($($p::Item,)* ) -> R) -> Array<R, D>
+            {
+                // Make uninit result
+                let mut output = self.uninitalized_for_current_layout::<R>();
+
+                // Use partial to counts the number of filled elements, and can drop the right
+                // number of elements on unwinding (if it happens during apply/collect).
+                unsafe {
+                    let output_view = output.raw_view_mut().cast::<R>();
+                    self.and(output_view)
+                        .collect_with_partial(f)
+                        .release_ownership();
+
+                    output.assume_init()
+                }
+            }
+
+            /// Apply and assign the results into the producer `into`, which should have the same
+            /// size as the other inputs.
+            ///
+            /// The producer should have assignable items as dictated by the `AssignElem` trait,
+            /// for example `&mut R`.
+            pub fn apply_assign_into<R, Q>(self, into: Q, mut f: impl FnMut($($p::Item,)* ) -> R)
+                where Q: IntoNdProducer<Dim=D>,
+                      Q::Item: AssignElem<R>
+            {
+                self.and(into)
+                    .apply(move |$($p, )* output_| {
+                        output_.assign_elem(f($($p ),*));
+                    });
+            }
+
+
             );
 
             /// Split the `Zip` evenly in two.
@@ -990,23 +1107,95 @@ macro_rules! map_impl {
             pub fn split(self) -> (Self, Self) {
                 debug_assert_ne!(self.size(), 0, "Attempt to split empty zip");
                 debug_assert_ne!(self.size(), 1, "Attempt to split zip with 1 elem");
+                SplitPreference::split(self)
+            }
+        }
+
+        expand_if!(@bool [$notlast]
+            // For collect; Last producer is a RawViewMut
+            #[allow(non_snake_case)]
+            impl<D, PLast, R, $($p),*> Zip<($($p,)* PLast), D>
+                where D: Dimension,
+                      $($p: NdProducer<Dim=D> ,)*
+                      PLast: NdProducer<Dim = D, Item = *mut R, Ptr = *mut R, Stride = isize>,
+            {
+                /// The inner workings of apply_collect and par_apply_collect
+                ///
+                /// Apply the function and collect the results into the output (last producer)
+                /// which should be a raw array view; a Partial that owns the written
+                /// elements is returned.
+                ///
+                /// Elements will be overwritten in place (in the sense of std::ptr::write).
+                ///
+                /// ## Safety
+                ///
+                /// The last producer is a RawArrayViewMut and must be safe to write into.
+                /// The producer must be c- or f-contig and have the same layout tendency
+                /// as the whole Zip.
+                ///
+                /// The returned Partial's proxy ownership of the elements must be handled,
+                /// before the array the raw view points to realizes its ownership.
+                pub(crate) unsafe fn collect_with_partial<F>(self, mut f: F) -> Partial<R>
+                    where F: FnMut($($p::Item,)* ) -> R
+                {
+                    // Get the last producer; and make a Partial that aliases its data pointer
+                    let (.., ref output) = &self.parts;
+                    debug_assert!(output.layout().is(CORDER | FORDER));
+                    debug_assert_eq!(output.layout().tendency() >= 0, self.layout_tendency >= 0);
+                    let mut partial = Partial::new(output.as_ptr());
+
+                    // Apply the mapping function on this zip
+                    // if we panic with unwinding; Partial will drop the written elements.
+                    let partial_len = &mut partial.len;
+                    self.apply(move |$($p,)* output_elem: *mut R| {
+                        output_elem.write(f($($p),*));
+                        if std::mem::needs_drop::<R>() {
+                            *partial_len += 1;
+                        }
+                    });
+
+                    partial
+                }
+            }
+        );
+
+        impl<D, $($p),*> SplitPreference for Zip<($($p,)*), D>
+            where D: Dimension,
+                  $($p: NdProducer<Dim=D> ,)*
+        {
+            fn can_split(&self) -> bool { self.size() > 1 }
+
+            fn split_preference(&self) -> (Axis, usize) {
                 // Always split in a way that preserves layout (if any)
                 let axis = self.max_stride_axis();
                 let index = self.len_of(axis) / 2;
+                (axis, index)
+            }
+        }
+
+        impl<D, $($p),*> SplitAt for Zip<($($p,)*), D>
+            where D: Dimension,
+                  $($p: NdProducer<Dim=D> ,)*
+        {
+            fn split_at(self, axis: Axis, index: usize) -> (Self, Self) {
                 let (p1, p2) = self.parts.split_at(axis, index);
                 let (d1, d2) = self.dimension.split_at(axis, index);
                 (Zip {
                     dimension: d1,
                     layout: self.layout,
                     parts: p1,
+                    layout_tendency: self.layout_tendency,
                 },
                 Zip {
                     dimension: d2,
                     layout: self.layout,
                     parts: p2,
+                    layout_tendency: self.layout_tendency,
                 })
             }
+
         }
+
         )+
     }
 }

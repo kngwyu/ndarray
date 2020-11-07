@@ -5,6 +5,7 @@ The ``ndarray`` crate provides an *n*-dimensional container for general elements
 and for numerics.
 
 Please read the `API documentation on docs.rs`__
+or take a look at the `quickstart tutorial <./README-quick-start.md>`_.
 
 __ https://docs.rs/ndarray/
 
@@ -84,6 +85,15 @@ provider::
     blas-src = { version = "0.2.0", default-features = false, features = ["openblas"] }
     openblas-src = { version = "0.6.0", default-features = false, features = ["cblas", "system"] }
 
+For official releases of ``ndarray``, the versions are:
+
+=========== ============ ================
+``ndarray`` ``blas-src`` ``openblas-src``
+=========== ============ ================
+0.13.0      0.2.0        0.6.0
+0.12.\*     0.2.0        0.6.0
+0.11.\*     0.1.2        0.5.0
+=========== ============ ================
 
 Recent Changes
 --------------

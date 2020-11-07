@@ -1,6 +1,11 @@
-use crate::{ArrayBase, DataMut, Dimension, NdProducer, Zip};
+use crate::{Array, ArrayBase, DataMut, Dimension, IntoNdProducer, NdProducer, Zip};
+use crate::AssignElem;
 
 use crate::parallel::prelude::*;
+use crate::parallel::par::ParallelSplits;
+use super::send_producer::SendProducer;
+
+use crate::partial::Partial;
 
 /// # Parallel methods
 ///
@@ -42,8 +47,10 @@ where
 
 // Zip
 
+const COLLECT_MAX_SPLITS: usize = 10;
+
 macro_rules! zip_impl {
-    ($([$($p:ident)*],)+) => {
+    ($([$notlast:ident $($p:ident)*],)+) => {
         $(
         #[allow(non_snake_case)]
         impl<D, $($p),*> Zip<($($p,)*), D>
@@ -63,16 +70,84 @@ macro_rules! zip_impl {
             {
                 self.into_par_iter().for_each(move |($($p,)*)| function($($p),*))
             }
+
+            expand_if!(@bool [$notlast]
+
+            /// Apply and collect the results into a new array, which has the same size as the
+            /// inputs.
+            ///
+            /// If all inputs are c- or f-order respectively, that is preserved in the output.
+            pub fn par_apply_collect<R>(self, f: impl Fn($($p::Item,)* ) -> R + Sync + Send)
+                -> Array<R, D>
+                where R: Send
+            {
+                let mut output = self.uninitalized_for_current_layout::<R>();
+                let total_len = output.len();
+
+                // Create a parallel iterator that produces chunks of the zip with the output
+                // array.  It's crucial that both parts split in the same way, and in a way
+                // so that the chunks of the output are still contig.
+                //
+                // Use a raw view so that we can alias the output data here and in the partial
+                // result.
+                let splits = unsafe {
+                    ParallelSplits {
+                        iter: self.and(SendProducer::new(output.raw_view_mut().cast::<R>())),
+                        // Keep it from splitting the Zip down too small
+                        max_splits: COLLECT_MAX_SPLITS,
+                    }
+                };
+
+                let collect_result = splits.map(move |zip| {
+                    // Apply the mapping function on this chunk of the zip
+                    // Create a partial result for the contiguous slice of data being written to
+                    unsafe {
+                        zip.collect_with_partial(&f)
+                    }
+                })
+                .reduce(Partial::stub, Partial::try_merge);
+
+                if std::mem::needs_drop::<R>() {
+                    debug_assert_eq!(total_len, collect_result.len,
+                        "collect len is not correct, expected {}", total_len);
+                    assert!(collect_result.len == total_len,
+                        "Collect: Expected number of writes not completed");
+                }
+
+                // Here the collect result is complete, and we release its ownership and transfer
+                // it to the output array.
+                collect_result.release_ownership();
+                unsafe {
+                    output.assume_init()
+                }
+            }
+
+            /// Apply and assign the results into the producer `into`, which should have the same
+            /// size as the other inputs.
+            ///
+            /// The producer should have assignable items as dictated by the `AssignElem` trait,
+            /// for example `&mut R`.
+            pub fn par_apply_assign_into<R, Q>(self, into: Q, f: impl Fn($($p::Item,)* ) -> R + Sync + Send)
+                where Q: IntoNdProducer<Dim=D>,
+                      Q::Item: AssignElem<R> + Send,
+                      Q::Output: Send,
+            {
+                self.and(into)
+                    .par_apply(move |$($p, )* output_| {
+                        output_.assign_elem(f($($p ),*));
+                    });
+            }
+            );
         }
         )+
     }
 }
 
 zip_impl! {
-    [P1],
-    [P1 P2],
-    [P1 P2 P3],
-    [P1 P2 P3 P4],
-    [P1 P2 P3 P4 P5],
-    [P1 P2 P3 P4 P5 P6],
+    [true P1],
+    [true P1 P2],
+    [true P1 P2 P3],
+    [true P1 P2 P3 P4],
+    [true P1 P2 P3 P4 P5],
+    [false P1 P2 P3 P4 P5 P6],
 }
